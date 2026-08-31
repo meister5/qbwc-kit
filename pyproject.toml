@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qbwc-kit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Talk to QuickBooks Desktop over the Web Connector: SOAP callbacks, qbXML, and test doubles."
 readme = "README.md"
 requires-python = ">=3.10"
