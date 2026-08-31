@@ -8,10 +8,15 @@ eight operations, string and int parts only, one string-array return type.
 
 from __future__ import annotations
 
+import re
+from xml.sax.saxutils import escape, quoteattr
+
 from .soap import QBWC_NS
 
+# ``serverVersion`` takes no arguments; every other operation is named after
+# the parts Intuit's own QBWebConnectorSvc.wsdl declares.
 _OPERATIONS: tuple[tuple[str, tuple[tuple[str, str], ...], str], ...] = (
-    ("serverVersion", (("strVersion", "s:string"),), "s:string"),
+    ("serverVersion", (), "s:string"),
     ("clientVersion", (("strVersion", "s:string"),), "s:string"),
     (
         "authenticate",
@@ -108,6 +113,11 @@ def _binding() -> str:
     )
 
 
+#: A WSDL service name lands in element names and QName references, so it has
+#: to be an XML NCName rather than free text.
+_NCNAME = re.compile(r"^[A-Za-z_][\w.\-]*$")
+
+
 def build_wsdl(endpoint_url: str, service_name: str = "QBWebConnectorSvc") -> str:
     """Render the WSDL for a service mounted at ``endpoint_url``.
 
@@ -115,6 +125,8 @@ def build_wsdl(endpoint_url: str, service_name: str = "QBWebConnectorSvc") -> st
     including scheme and port; a mismatch there produces a connector error
     that gives no hint about the cause.
     """
+    if not _NCNAME.match(service_name):
+        raise ValueError(f"service_name must be an XML name, got {service_name!r}")
     return (
         '<?xml version="1.0" encoding="utf-8"?>'
         f'<wsdl:definitions xmlns:s="http://www.w3.org/2001/XMLSchema"'
@@ -138,7 +150,7 @@ def build_wsdl(endpoint_url: str, service_name: str = "QBWebConnectorSvc") -> st
         "</wsdl:binding>"
         f'<wsdl:service name="{service_name}">'
         f'<wsdl:port name="{service_name}Soap" binding="tns:{service_name}Soap">'
-        f'<soap:address location="{endpoint_url}"/>'
+        f"<soap:address location={quoteattr(endpoint_url)}/>"
         "</wsdl:port></wsdl:service>"
         "</wsdl:definitions>"
     )
@@ -161,20 +173,24 @@ def build_qwc(
     ``OwnerID`` and ``FileID`` are GUIDs that identify the integration to
     QuickBooks; regenerating them forces every user to re-authorise, so they
     belong in configuration, not in code.
+
+    Everything is XML-escaped: an ampersand in an app name or a query string in
+    the URL would otherwise produce a file the Web Connector refuses to import,
+    with "invalid file" as the entire explanation.
     """
     support = support_url or app_url
     return (
         '<?xml version="1.0"?>'
         "<QBWCXML>"
-        f"<AppName>{app_name}</AppName>"
-        f"<AppID>{app_id}</AppID>"
-        f"<AppURL>{app_url}</AppURL>"
-        f"<AppDescription>{app_description}</AppDescription>"
-        f"<AppSupport>{support}</AppSupport>"
-        f"<UserName>{username}</UserName>"
-        f"<OwnerID>{owner_id}</OwnerID>"
-        f"<FileID>{file_id}</FileID>"
+        f"<AppName>{escape(app_name)}</AppName>"
+        f"<AppID>{escape(app_id)}</AppID>"
+        f"<AppURL>{escape(app_url)}</AppURL>"
+        f"<AppDescription>{escape(app_description)}</AppDescription>"
+        f"<AppSupport>{escape(support)}</AppSupport>"
+        f"<UserName>{escape(username)}</UserName>"
+        f"<OwnerID>{escape(owner_id)}</OwnerID>"
+        f"<FileID>{escape(file_id)}</FileID>"
         "<QBType>QBFS</QBType>"
-        f"<Scheduler><RunEveryNSeconds>{run_every_n_seconds}</RunEveryNSeconds></Scheduler>"
+        f"<Scheduler><RunEveryNSeconds>{int(run_every_n_seconds)}</RunEveryNSeconds></Scheduler>"
         "</QBWCXML>"
     )

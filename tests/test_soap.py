@@ -98,6 +98,31 @@ def test_booleans_are_rejected():
         soap.build_response("clientVersion", True)
 
 
+def test_text_split_around_a_comment_is_not_truncated():
+    # Taking only element.text would silently drop everything after the
+    # comment, which for receiveResponseXML means half a qbXML document.
+    call = soap.parse_request(
+        envelope(
+            "<receiveResponseXML><response>&lt;QBXML&gt;"
+            "<!-- injected -->&lt;/QBXML&gt;</response></receiveResponseXML>"
+        )
+    )
+    assert call.get("response") == "<QBXML></QBXML>"
+
+
+def test_comments_are_not_counted_as_method_elements():
+    call = soap.parse_request(envelope("<!-- hello --><serverVersion/><!-- bye -->"))
+    assert call.method == "serverVersion"
+
+
+def test_repeated_parameter_names_keep_the_last_value_and_stay_positional():
+    call = soap.parse_request(
+        envelope("<getLastError><ticket>a</ticket><ticket>b</ticket></getLastError>")
+    )
+    assert call.get("ticket") == "b"
+    assert call.positional(1) == "b"
+
+
 def test_fault_carries_message():
     xml = soap.build_fault("nope")
     assert "<faultstring>nope</faultstring>" in xml

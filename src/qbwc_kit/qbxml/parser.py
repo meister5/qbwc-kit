@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from xml.etree import ElementTree as ET
 
+from .._xml import fromstring
 from .types import STATUS_NOTHING_FOUND, STATUS_OK, Severity
 
 
@@ -35,13 +36,18 @@ def _text(node: ET.Element) -> str:
     return (node.text or "").strip()
 
 
+def _is_element(node: ET.Element) -> bool:
+    """False for comments and processing instructions, whose tag is a callable."""
+    return isinstance(node.tag, str)
+
+
 def _to_dict(node: ET.Element) -> Any:
     """Convert a qbXML aggregate into plain Python.
 
     Repeated sibling tags become lists, which is how line items, addresses with
     multiple lines, and custom fields all arrive.
     """
-    children = list(node)
+    children = [child for child in node if _is_element(child)]
     if not children:
         return _text(node)
 
@@ -141,10 +147,18 @@ class ResponseSet:
         return None
 
     def first(self, name: str | None = None) -> Response:
+        """The first response, optionally the first matching a name or entity.
+
+        Raises :class:`KeyError` rather than returning ``None``: a task that
+        asked for a response and got nothing has already gone wrong, and
+        failing here beats an ``AttributeError`` two lines later.
+        """
         for response in self.responses:
             if name is None or response.name == name or response.entity == name:
                 return response
-        raise KeyError(name)
+        if name is None:
+            raise KeyError("the response set is empty")
+        raise KeyError(f"no response named {name!r} in {[r.name for r in self.responses]}")
 
     def raise_for_status(self) -> ResponseSet:
         for response in self.responses:
@@ -169,7 +183,7 @@ def parse_response(payload: str | bytes) -> ResponseSet:
         return ResponseSet()
 
     try:
-        root = ET.fromstring(payload)
+        root = fromstring(payload)
     except ET.ParseError as exc:
         raise QBXMLParseError(f"malformed qbXML: {exc}") from exc
 
@@ -180,7 +194,7 @@ def parse_response(payload: str | bytes) -> ResponseSet:
     if msgs is None:
         raise QBXMLParseError("response has no QBXMLMsgsRs")
 
-    responses = [_parse_one(node) for node in msgs]
+    responses = [_parse_one(node) for node in msgs if _is_element(node)]
     return ResponseSet(responses=responses)
 
 
@@ -191,18 +205,23 @@ def _parse_one(node: ET.Element) -> Response:
         raise QBXMLParseError(f"non-numeric statusCode on {node.tag}") from exc
 
     remaining = node.get("iteratorRemainingCount")
+    try:
+        remaining_count = int(remaining) if remaining is not None else None
+    except ValueError as exc:
+        raise QBXMLParseError(f"non-numeric iteratorRemainingCount on {node.tag}") from exc
+
     response = Response(
         name=node.tag,
         status_code=status_code,
         status_severity=node.get("statusSeverity", Severity.INFO.value),
         status_message=node.get("statusMessage", ""),
         request_id=node.get("requestID"),
-        iterator_remaining_count=int(remaining) if remaining is not None else None,
+        iterator_remaining_count=remaining_count,
         iterator_id=node.get("iteratorID"),
     )
 
     for child in node:
-        if child.tag in _NON_RECORD_TAGS:
+        if not _is_element(child) or child.tag in _NON_RECORD_TAGS:
             continue
         value = _to_dict(child)
         response.records.append(value if isinstance(value, dict) else {child.tag: value})

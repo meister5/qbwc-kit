@@ -15,6 +15,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
+from ._xml import fromstring
+
 QBWC_NS = "http://developer.intuit.com/"
 SOAP_ENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 
@@ -30,6 +32,27 @@ def localname(tag: str) -> str:
     if match is None:  # pragma: no cover - ElementTree never produces this
         raise SoapError(f"uninterpretable tag: {tag!r}")
     return match.group(1)
+
+
+def _is_element(node: ET.Element) -> bool:
+    """False for comments and processing instructions, whose tag is a callable."""
+    return isinstance(node.tag, str)
+
+
+def _flatten_text(node: ET.Element) -> str:
+    """All character data under ``node``, comments excluded.
+
+    An escaped qbXML payload normally arrives as a single text node, but a body
+    that passed through something that reformatted it can come back split
+    around a comment, and taking only ``node.text`` would silently truncate the
+    response document.
+    """
+    parts = [node.text or ""]
+    for child in node:
+        if _is_element(child):
+            parts.append(_flatten_text(child))
+        parts.append(child.tail or "")
+    return "".join(parts)
 
 
 @dataclass(frozen=True)
@@ -51,7 +74,7 @@ class SoapCall:
     def positional(self, index: int, default: str = "") -> str:
         try:
             return self.params[self.order[index]]
-        except IndexError:
+        except (IndexError, KeyError):
             return default
 
 
@@ -61,10 +84,8 @@ def parse_request(body: str | bytes) -> SoapCall:
     Raises :class:`SoapError` for anything that is not a single-method
     envelope, which is all the Web Connector ever sends.
     """
-    if isinstance(body, bytes):
-        body = body.decode("utf-8")
     try:
-        root = ET.fromstring(body)
+        root = fromstring(body)
     except ET.ParseError as exc:
         raise SoapError(f"malformed XML: {exc}") from exc
 
@@ -73,13 +94,13 @@ def parse_request(body: str | bytes) -> SoapCall:
 
     soap_body = None
     for child in root:
-        if localname(child.tag) == "Body":
+        if _is_element(child) and localname(child.tag) == "Body":
             soap_body = child
             break
     if soap_body is None:
         raise SoapError("envelope has no Body")
 
-    calls = list(soap_body)
+    calls = [child for child in soap_body if _is_element(child)]
     if len(calls) != 1:
         raise SoapError(f"expected exactly one method element, got {len(calls)}")
 
@@ -87,8 +108,10 @@ def parse_request(body: str | bytes) -> SoapCall:
     params: dict[str, str] = {}
     order: list[str] = []
     for param in call:
+        if not _is_element(param):
+            continue
         name = localname(param.tag)
-        params[name] = param.text or ""
+        params[name] = _flatten_text(param)
         order.append(name)
 
     return SoapCall(method=localname(call.tag), params=params, order=tuple(order))
