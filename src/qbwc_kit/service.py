@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import soap
 from .session import (
@@ -40,6 +40,19 @@ def _parse_version(text: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _as_int(text: str, default: int) -> int:
+    """Parse an integer callback parameter, tolerating whatever QBWC sent.
+
+    The qbXML version numbers arrive as strings and are only used to fill in
+    :class:`~qbwc_kit.session.TaskContext`. Faulting the whole call because one
+    of them was blank or malformed would make QBWC retry the update forever.
+    """
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class QBWCService:
     """Implements the QBWC contract on top of an :class:`Authenticator`.
@@ -50,14 +63,19 @@ class QBWCService:
     """
 
     authenticator: Authenticator
-    store: SessionStore | None = None
+    store: SessionStore = field(default_factory=SessionStore)
     server_version: str = SERVER_VERSION
     min_client_version: tuple[int, ...] = MIN_CLIENT_VERSION
     on_session_end: Callable[[Session], None] | None = None
 
     def __post_init__(self) -> None:
-        if self.store is None:
+        if self.store is None:  # explicit store=None used to mean "give me one"
             self.store = SessionStore()
+        # A session that ages out of the store never sees closeConnection, so
+        # route evictions through the same hook to keep the "exactly once"
+        # promise above honest.
+        if self.store.on_evict is None:
+            self.store.on_evict = self._end_session
 
     # -- SOAP entry point -------------------------------------------------
 
@@ -148,19 +166,28 @@ class QBWCService:
         ctx = session.context
         ctx.company_file = call.get("strCompanyFileName", ctx.company_file)
         ctx.country = call.get("qbXMLCountry") or ctx.country
-        ctx.major_version = int(call.get("qbXMLMajorVers") or ctx.major_version or 0)
-        ctx.minor_version = int(call.get("qbXMLMinorVers") or ctx.minor_version or 0)
+        ctx.major_version = _as_int(call.get("qbXMLMajorVers"), ctx.major_version)
+        ctx.minor_version = _as_int(call.get("qbXMLMinorVers"), ctx.minor_version)
 
-        try:
-            request = session.next_request()
-        except Exception as exc:  # noqa: BLE001 - surface via getLastError, not a fault
-            session.record_error(f"{type(exc).__name__}: {exc}")
-            logger.exception("task %s failed while building a request", session.index)
-            return ""
+        # A task that fails while building its request has retired itself, so
+        # keep asking: one broken task should not cancel the ones behind it.
+        # The bound is the task count, since every failure consumes one.
+        for _ in range(len(session.tasks) - session.index + 1):
+            attempted = session.index
+            try:
+                request = session.next_request()
+            except Exception as exc:  # noqa: BLE001 - surface via getLastError, not a fault
+                session.record_error(f"{type(exc).__name__}: {exc}")
+                logger.exception("task %s failed while building a request", attempted)
+                if session.index != attempted:
+                    continue
+                break  # the session itself is wedged; retrying would repeat it
+            if request:
+                return request
+            break
 
-        if not request:
-            logger.info("session %s has no further requests", session.ticket[:8])
-        return request
+        logger.info("session %s has no further requests", session.ticket[:8])
+        return ""
 
     def _do_receiveResponseXML(self, call: soap.SoapCall) -> int:
         """Return percent complete; 100 ends the session, negative aborts it."""
@@ -207,13 +234,26 @@ class QBWCService:
         session = self.store.get(call.get("ticket") or call.positional(0))
         return session.last_error() or "no error recorded"
 
+    def _end_session(self, session: Session) -> None:
+        """Fire ``on_session_end``, never letting it break the callback.
+
+        This runs while answering ``closeConnection`` (or while pruning), and a
+        reporting hook that raises must not turn a finished sync into a SOAP
+        fault that QBWC will retry.
+        """
+        if self.on_session_end is None:
+            return
+        try:
+            self.on_session_end(session)
+        except Exception:  # noqa: BLE001 - the sync itself already succeeded
+            logger.exception("on_session_end failed for session %s", session.ticket[:8])
+
     def _do_closeConnection(self, call: soap.SoapCall) -> str:
         ticket = call.get("ticket") or call.positional(0)
         session = self.store.close(ticket)
         if session is None:
             return "OK"
-        if self.on_session_end is not None:
-            self.on_session_end(session)
+        self._end_session(session)
         if session.errors:
             logger.warning("session %s closed with %d error(s)", ticket[:8], len(session.errors))
             return f"Completed with {len(session.errors)} error(s)"

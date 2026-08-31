@@ -1,7 +1,7 @@
 import pytest
 
 from qbwc_kit import qbxml
-from qbwc_kit.qbxml import QBXMLRequest
+from qbwc_kit.qbxml import QBXMLParseError, QBXMLRequest
 from qbwc_kit.session import (
     Session,
     SessionError,
@@ -201,6 +201,92 @@ def test_task_can_yield_a_raw_string():
     assert session.next_request() == "<QBXML/>"
 
 
+class TestFailingTasks:
+    """A task that raises must retire itself rather than be retried forever.
+
+    ``next_request`` restarts ``task.run`` from scratch whenever no generator
+    is suspended, so a task left half-installed after an exception silently
+    replays from the top on the connector's next callback.
+    """
+
+    def test_a_task_that_raises_while_building_is_retired(self):
+        class Broken:
+            name = "broken"
+
+            def run(self, ctx):
+                raise RuntimeError("no database")
+                yield  # pragma: no cover - makes this a generator
+
+        good = RecordingTask("good")
+        session = make_session([Broken(), good])
+
+        with pytest.raises(RuntimeError, match="no database"):
+            session.next_request()
+        assert session.index == 1
+
+        assert "CustomerQueryRq" in session.next_request()
+        session.submit_response(EMPTY)
+        assert session.finished
+
+    def test_a_task_that_raises_while_handling_a_response_is_retired(self):
+        class Broken:
+            name = "broken"
+
+            def run(self, ctx):
+                yield QBXMLRequest([qbxml.query("Customer")])
+                raise RuntimeError("disk full")
+
+        session = make_session([Broken(), RecordingTask("good")])
+        session.next_request()
+        with pytest.raises(RuntimeError, match="disk full"):
+            session.submit_response(EMPTY)
+
+        assert session.index == 1
+        assert "CustomerQueryRq" in session.next_request()
+
+    def test_an_unparseable_response_does_not_restart_the_task(self):
+        task = RecordingTask("a", count=3)
+        session = make_session([task, RecordingTask("b")])
+        session.next_request()
+
+        with pytest.raises(QBXMLParseError):
+            session.submit_response("<<<not xml")
+
+        assert session.index == 1
+        assert "b-0" in session.next_request()
+        assert task.seen == []
+
+    def test_yielding_an_empty_request_is_refused(self):
+        # sendRequestXML returning "" means "the session is over", so an empty
+        # yield would end the update early and skip everything after it.
+        class Empty:
+            name = "empty"
+
+            def run(self, ctx):
+                yield ""
+
+        session = make_session([Empty(), RecordingTask("real")])
+        with pytest.raises(SessionError, match="empty request"):
+            session.next_request()
+        assert "CustomerQueryRq" in session.next_request()
+
+    def test_a_second_yield_that_cannot_be_rendered_retires_the_task(self):
+        class BadSecondPage:
+            name = "bad"
+
+            def run(self, ctx):
+                yield QBXMLRequest([qbxml.query("Customer")])
+                yield QBXMLRequest([])  # an empty batch cannot be rendered
+
+        session = make_session([BadSecondPage(), RecordingTask("good")])
+        session.next_request()
+        with pytest.raises(ValueError):
+            session.submit_response(EMPTY)
+
+        assert session.index == 1
+        assert "CustomerQueryRq" in session.next_request()
+
+
 def test_context_exposes_negotiated_version():
     session = make_session([])
     session.context.major_version, session.context.minor_version = 13, 0
@@ -233,6 +319,48 @@ class TestSessionStore:
         assert store.prune() == 1
         assert len(store) == 0
 
+    def test_eviction_notifies_the_owner(self):
+        # A session that ages out never sees closeConnection, so this hook is
+        # the only notice an integration gets that a sync stopped halfway.
+        evicted = []
+        store = SessionStore(ttl_seconds=0.0, on_evict=evicted.append)
+        session = store.create("u", [])
+        store.prune()
+
+        assert evicted == [session]
+        assert session.closed
+        # And it is gone, so a second prune does not report it twice.
+        assert store.prune() == 0
+
+    def test_creating_a_session_prunes_the_expired_ones(self):
+        store = SessionStore(ttl_seconds=0.0)
+        store.create("u", [])
+        store.create("u", [])
+        assert len(store) == 1
+
+    def test_concurrent_use_does_not_lose_sessions(self):
+        import threading
+
+        store = SessionStore()
+        tickets: list[str] = []
+        lock = threading.Lock()
+
+        def worker():
+            for _ in range(50):
+                session = store.create("u", [])
+                assert store.get(session.ticket) is session
+                with lock:
+                    tickets.append(session.ticket)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(set(tickets)) == 200
+        assert len(store) == 200
+
 
 class TestStaticAuthenticator:
     def test_accepts_matching_credentials(self):
@@ -244,6 +372,16 @@ class TestStaticAuthenticator:
     )
     def test_rejects_anything_else(self, user, password):
         assert not StaticAuthenticator("qbwc", "s3cret", []).authenticate(user, password)
+
+    @pytest.mark.parametrize("user,password", [("qbwc", "pÃ¤ssword"), ("ünïcode", "s3cret")])
+    def test_non_ascii_credentials_are_rejected_not_crashed(self, user, password):
+        # secrets.compare_digest raises TypeError on non-ASCII str arguments,
+        # which would turn a wrong password into a SOAP fault.
+        assert not StaticAuthenticator("qbwc", "s3cret", []).authenticate(user, password)
+
+    def test_non_ascii_credentials_can_still_match(self):
+        auth = StaticAuthenticator("ünïcode", "pÃ¤ssword", [])
+        assert auth.authenticate("ünïcode", "pÃ¤ssword")
 
     def test_hands_out_a_fresh_task_list(self):
         tasks = [RecordingTask("a")]

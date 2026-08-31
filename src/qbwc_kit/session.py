@@ -32,8 +32,9 @@ into a per-request switch statement.
 from __future__ import annotations
 
 import secrets
+import threading
 import time
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -166,15 +167,21 @@ class Session:
 
         while not self.finished:
             task = self.tasks[self.index]
-            self._generator = task.run(self.context)
+            generator = self._generator = task.run(self.context)
             try:
-                payload = next(self._generator)
+                rendered = _render(next(generator))
             except StopIteration:
                 # A task that yields nothing is a no-op, not an error.
                 self._finish_task()
                 continue
+            except Exception:
+                # The task blew up before it asked for anything, or asked for
+                # something unrenderable. Retire it so the caller can move on
+                # instead of restarting it from the top on the next callback.
+                self._abandon(generator)
+                raise
             self._awaiting = True
-            return _render(payload)
+            return rendered
 
         return ""
 
@@ -184,17 +191,38 @@ class Session:
             raise SessionError("submit_response called with no request outstanding")
 
         self._awaiting = False
-        parsed = parse_response(payload)
+        generator = self._generator
+
+        # Anything that goes wrong from here on leaves the task suspended
+        # mid-job with no way to resume it, so retire it rather than let the
+        # next sendRequestXML silently restart it from the top.
         try:
-            next_payload = self._generator.send(parsed)
+            parsed = parse_response(payload)
+        except Exception:
+            self._abandon(generator)
+            raise
+
+        try:
+            next_payload = generator.send(parsed)
         except StopIteration:
             self._finish_task()
             return parsed
+        except Exception:
+            self._finish_task()  # send() already exhausted the generator
+            raise
 
-        # The task wants another round trip. Hold the rendered request until
-        # QBWC comes back with sendRequestXML.
-        self._pending = _render(next_payload)
+        try:
+            # The task wants another round trip. Hold the rendered request
+            # until QBWC comes back with sendRequestXML.
+            self._pending = _render(next_payload)
+        except Exception:
+            self._abandon(generator)
+            raise
         return parsed
+
+    def _abandon(self, generator: TaskRun) -> None:
+        self._finish_task()
+        generator.close()
 
     def abort(self, message: str) -> None:
         """Give up on the current task and move on, recording why."""
@@ -217,7 +245,12 @@ class Session:
 
 
 def _render(payload: QBXMLRequest | str) -> str:
-    return payload.render() if isinstance(payload, QBXMLRequest) else payload
+    rendered = payload.render() if isinstance(payload, QBXMLRequest) else payload
+    if not rendered:
+        # sendRequestXML returning "" means "the session is over", so an empty
+        # yield would end the update early and silently skip the rest.
+        raise SessionError("a task yielded an empty request")
+    return rendered
 
 
 class SessionStore:
@@ -225,49 +258,71 @@ class SessionStore:
 
     QBWC keeps a ticket only for the duration of one update, so anything older
     than the timeout is an abandoned session (a crashed connector, a company
-    file closed mid-sync) and is safe to drop.
+    file closed mid-sync) and is safe to drop. ``on_evict`` is called for each
+    session dropped that way, which is the only notice an integration gets that
+    a sync stopped halfway.
+
+    Every method is safe to call from several threads, because a server that
+    runs the blocking dispatch off the event loop can have two connectors
+    authenticating at once.
     """
 
-    def __init__(self, ttl_seconds: float = 3600.0) -> None:
+    def __init__(
+        self,
+        ttl_seconds: float = 3600.0,
+        *,
+        on_evict: Callable[[Session], None] | None = None,
+    ) -> None:
         self.ttl_seconds = ttl_seconds
+        self.on_evict = on_evict
         self._sessions: dict[str, Session] = {}
+        self._lock = threading.Lock()
 
     def create(self, username: str, tasks: Sequence[Task]) -> Session:
         self.prune()
-        ticket = secrets.token_urlsafe(24)
         session = Session(
-            ticket=ticket,
+            ticket=secrets.token_urlsafe(24),
             username=username,
             tasks=list(tasks),
             created_at=time.monotonic(),
         )
-        self._sessions[ticket] = session
+        with self._lock:
+            self._sessions[session.ticket] = session
         return session
 
     def get(self, ticket: str) -> Session:
-        session = self._sessions.get(ticket)
+        with self._lock:
+            session = self._sessions.get(ticket)
         if session is None:
             raise UnknownTicket(ticket)
         return session
 
     def close(self, ticket: str) -> Session | None:
-        session = self._sessions.pop(ticket, None)
+        with self._lock:
+            session = self._sessions.pop(ticket, None)
         if session is not None:
             session.closed = True
         return session
 
     def prune(self) -> int:
+        """Drop every session older than the TTL, returning how many went."""
         cutoff = time.monotonic() - self.ttl_seconds
-        stale = [t for t, s in self._sessions.items() if s.created_at < cutoff]
-        for ticket in stale:
-            del self._sessions[ticket]
-        return len(stale)
+        with self._lock:
+            stale = [t for t, s in self._sessions.items() if s.created_at < cutoff]
+            dropped = [self._sessions.pop(ticket) for ticket in stale]
+        for session in dropped:
+            session.closed = True
+            if self.on_evict is not None:
+                self.on_evict(session)
+        return len(dropped)
 
     def __len__(self) -> int:
-        return len(self._sessions)
+        with self._lock:
+            return len(self._sessions)
 
     def __contains__(self, ticket: object) -> bool:
-        return ticket in self._sessions
+        with self._lock:
+            return ticket in self._sessions
 
 
 @runtime_checkable
@@ -292,8 +347,11 @@ class StaticAuthenticator:
         self._tasks = list(tasks)
 
     def authenticate(self, username: str, password: str) -> bool:
-        user_ok = secrets.compare_digest(username, self._username)
-        pass_ok = secrets.compare_digest(password, self._password)
+        # Encode first: compare_digest raises TypeError on str arguments that
+        # are not pure ASCII, and a credential with an accent in it must fail
+        # authentication, not crash the callback.
+        user_ok = secrets.compare_digest(username.encode("utf-8"), self._username.encode("utf-8"))
+        pass_ok = secrets.compare_digest(password.encode("utf-8"), self._password.encode("utf-8"))
         return user_ok and pass_ok
 
     def tasks_for(self, username: str) -> list[Task]:

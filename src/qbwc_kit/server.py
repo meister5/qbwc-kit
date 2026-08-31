@@ -18,6 +18,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 try:
     from fastapi import FastAPI, Request, Response
+    from starlette.concurrency import run_in_threadpool
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised by install shape, not tests
     raise ModuleNotFoundError(
         "qbwc_kit.server needs FastAPI. Install it with: pip install fastapi"
@@ -54,6 +55,11 @@ def create_app(
     @app.post(path)
     async def handle_soap(request: Request) -> Response:
         body = await request.body()
-        return Response(content=service.dispatch(body), media_type=SOAP_CONTENT_TYPE)
+        # Tasks are ordinary blocking code - they hit databases and HTTP APIs -
+        # and a multi-megabyte qbXML response is not free to parse either.
+        # Running dispatch on the event loop would stall every other request
+        # for the duration, including a second connector's poll.
+        content = await run_in_threadpool(service.dispatch, body)
+        return Response(content=content, media_type=SOAP_CONTENT_TYPE)
 
     return app
