@@ -16,11 +16,15 @@ qbXML the way QuickBooks does, including iterators and non-zero statuses.
 from __future__ import annotations
 
 import itertools
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from xml.etree import ElementTree as ET
 
 from . import soap
+from ._xml import fromstring
+from .qbxml.builder import escape
+from .qbxml.types import STATUS_OBJECT_NOT_FOUND, STATUS_STALE_EDIT_SEQUENCE
 from .service import QBWCService
 
 #: Guard against a task whose iterator never terminates.
@@ -52,8 +56,13 @@ def service_transport(service: QBWCService) -> Transport:
 
 def _result(envelope: str) -> Any:
     """Pull the ``*Result`` payload out of a response envelope."""
-    root = ET.fromstring(envelope)
-    body = next(child for child in root if soap.localname(child.tag) == "Body")
+    root = fromstring(envelope)
+    body = next((child for child in root if soap.localname(child.tag) == "Body"), None)
+    if body is None or not len(body):
+        # Usually a transport that answered with a plain error page. Saying so
+        # beats the StopIteration or IndexError this used to raise.
+        raise AssertionError(f"expected a SOAP envelope with a body, got: {envelope[:200]}")
+
     first = list(body)[0]
     if soap.localname(first.tag) == "Fault":
         message = "".join(
@@ -98,7 +107,7 @@ class FakeWebConnector:
     username: str = "webconnector"
     password: str = "password"
     client_version: str = "2.3.0.36"
-    company_file: str = r"C:\\QuickBooks\\Test.QBW"
+    company_file: str = r"C:\QuickBooks\Test.QBW"
     country: str = "US"
     qbxml_version: tuple[int, int] = (13, 0)
     max_round_trips: int = DEFAULT_MAX_ROUND_TRIPS
@@ -107,7 +116,18 @@ class FakeWebConnector:
         return _result(self.transport(soap.build_request(method, params)))
 
     def server_version(self) -> str:
-        return self._call("serverVersion", [("strVersion", self.client_version)])
+        # serverVersion takes no arguments, matching Intuit's own WSDL.
+        return self._call("serverVersion", [])
+
+    def connection_error(self, ticket: str, hresult: str, message: str) -> str:
+        """Report that QBWC could not reach QuickBooks, as the real one does."""
+        return self._call(
+            "connectionError",
+            [("ticket", ticket), ("hresult", hresult), ("message", message)],
+        )
+
+    def last_error(self, ticket: str) -> str:
+        return self._call("getLastError", [("ticket", ticket)])
 
     def run_update(self, quickbooks: Responder | None = None) -> UpdateResult:
         """Run a full update cycle and return a transcript of it.
@@ -185,22 +205,63 @@ class Responder(Protocol):
     def __call__(self, request_xml: str) -> str: ...
 
 
+#: qbXML leads with an XML declaration and a ``<?qbxml ...?>`` instruction.
+#: ElementTree copes with those, but stripping them keeps the fake tolerant of
+#: hand-written fragments too.
+_PROCESSING_INSTRUCTION = re.compile(r"^\s*(?:<\?.*?\?>\s*)+")
+
+
 def _status_attrs(code: int, message: str, severity: str | None = None) -> str:
     if severity is None:
         severity = "Info" if code in (0, 1) else "Error"
-    escaped = message.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
-    return f'statusCode="{code}" statusSeverity="{severity}" statusMessage="{escaped}"'
+    return f'statusCode="{code}" statusSeverity="{severity}" statusMessage="{escape(message)}"'
+
+
+def _aggregate_to_dict(node: ET.Element | None) -> dict[str, Any]:
+    """Turn an ``<EntityAdd>`` / ``<EntityMod>`` aggregate into a record.
+
+    Nested aggregates (``BillAddress``, ``CustomerRef``) are kept as nested
+    dicts so that what comes back out of a Query looks like what went in.
+    """
+    if node is None:
+        return {}
+    record: dict[str, Any] = {}
+    for child in node:
+        value: Any = _aggregate_to_dict(child) if len(child) else (child.text or "").strip()
+        if child.tag in record:
+            existing = record[child.tag]
+            record[child.tag] = (
+                [*existing, value]
+                if isinstance(existing, list)
+                else [
+                    existing,
+                    value,
+                ]
+            )
+        else:
+            record[child.tag] = value
+    return record
 
 
 def _render_record(entity: str, record: dict[str, Any]) -> str:
-    def render(value: Any) -> str:
-        if isinstance(value, dict):
-            return "".join(f"<{k}>{render(v)}</{k}>" for k, v in value.items())
-        if isinstance(value, list):
-            return "".join(render(item) for item in value)
-        return str(value).replace("&", "&amp;").replace("<", "&lt;")
+    """Render a record as an ``<EntityRet>`` aggregate.
 
-    return f"<{entity}Ret>{render(record)}</{entity}Ret>"
+    A list repeats its own tag rather than nesting its items, because that is
+    how QuickBooks returns line items: two ``<InvoiceLineRet>`` siblings, not
+    one element holding both.
+    """
+
+    def render(name: str, value: Any) -> str:
+        if isinstance(value, list):
+            return "".join(render(name, item) for item in value)
+        if isinstance(value, dict):
+            return f"<{name}>{fields(value)}</{name}>"
+        return f"<{name}>{escape(value)}</{name}>"
+
+    def fields(mapping: dict[str, Any]) -> str:
+        return "".join(render(key, value) for key, value in mapping.items())
+
+    return f"<{entity}Ret>{fields(record)}</{entity}Ret>"
 
 
 @dataclass
@@ -209,7 +270,9 @@ class FakeQuickBooks:
 
     Supports the behaviour that actually matters when testing a sync: paged
     iterators, ``MaxReturned``, status 1 for an empty result, status 3100 for
-    an unsupported request, and monotonically increasing ListIDs on Add.
+    an unsupported request, monotonically increasing ListIDs on Add, and the
+    optimistic-concurrency check on Mod - a stale ``EditSequence`` is refused
+    with status 3200 exactly as QuickBooks refuses it.
     """
 
     entities: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -226,9 +289,7 @@ class FakeQuickBooks:
 
     def __call__(self, request_xml: str) -> str:
         self.seen.append(request_xml)
-        root = ET.fromstring(
-            request_xml.split("?>")[-1] if "<QBXML" in request_xml else request_xml
-        )
+        root = fromstring(_PROCESSING_INSTRUCTION.sub("", request_xml).lstrip())
         msgs = root.find("QBXMLMsgsRq")
         if msgs is None:
             raise AssertionError("request has no QBXMLMsgsRq")
@@ -253,6 +314,8 @@ class FakeQuickBooks:
             return self._query(response_name, attrs, entity, node)
         if name.endswith("AddRq"):
             return self._add(response_name, attrs, entity, node)
+        if name.endswith("ModRq"):
+            return self._mod(response_name, attrs, entity, node)
 
         return f"<{response_name}{attrs} {_status_attrs(3100, self.unsupported_message)}/>"
 
@@ -293,13 +356,32 @@ class FakeQuickBooks:
         return f"<{response_name}{attrs}{extra} {_status_attrs(0, 'Status OK')}>{body}</{response_name}>"
 
     def _add(self, response_name: str, attrs: str, entity: str, node: ET.Element) -> str:
-        payload = node.find(f"{entity}Add")
-        record: dict[str, Any] = {}
-        if payload is not None:
-            for child in payload:
-                record[child.tag] = (child.text or "").strip()
+        record = _aggregate_to_dict(node.find(f"{entity}Add"))
         record.setdefault("ListID", f"{entity.upper()}-{next(self._ids)}")
         record.setdefault("EditSequence", "1")
         self.entities.setdefault(entity, []).append(record)
         body = _render_record(entity, record)
+        return f"<{response_name}{attrs} {_status_attrs(0, 'Status OK')}>{body}</{response_name}>"
+
+    def _mod(self, response_name: str, attrs: str, entity: str, node: ET.Element) -> str:
+        changes = _aggregate_to_dict(node.find(f"{entity}Mod"))
+        key = "TxnID" if "TxnID" in changes else "ListID"
+        identifier = changes.get(key)
+
+        records = self.entities.setdefault(entity, [])
+        target = next((r for r in records if r.get(key) == identifier), None)
+        if target is None:
+            message = f"There is no {entity} with {key} {identifier}"
+            return f"<{response_name}{attrs} {_status_attrs(STATUS_OBJECT_NOT_FOUND, message)}/>"
+
+        # Optimistic concurrency: QuickBooks refuses a modification carrying an
+        # EditSequence that is not the current one, rather than clobbering the
+        # edit that bumped it.
+        if changes.get("EditSequence") != target.get("EditSequence"):
+            message = "The object you are trying to modify has been changed by another user"
+            return f"<{response_name}{attrs} {_status_attrs(STATUS_STALE_EDIT_SEQUENCE, message)}/>"
+
+        target.update({k: v for k, v in changes.items() if k != "EditSequence"})
+        target["EditSequence"] = str(int(target.get("EditSequence", "1")) + 1)
+        body = _render_record(entity, target)
         return f"<{response_name}{attrs} {_status_attrs(0, 'Status OK')}>{body}</{response_name}>"
