@@ -14,6 +14,9 @@ WSDL, keep a ticket-based session alive across many HTTP round trips, and hand-b
 QuickBooks rejects with unhelpful errors when the element order is wrong. I wrote all of that,
 so the only part left is the one specific to your data.
 
+Why QuickBooks Desktop has no API at all, and what the Web Connector actually costs you:
+[`docs/why-web-connector.md`](docs/why-web-connector.md).
+
 ```python
 from qbwc_kit import QBWCService, StaticAuthenticator, qbxml
 from qbwc_kit.qbxml import QBXMLRequest
