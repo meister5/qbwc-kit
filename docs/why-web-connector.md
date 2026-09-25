@@ -1,6 +1,6 @@
 # The only supported way into QuickBooks Desktop is the Web Connector
 
-*Published 2026-09-25. Copy approved by Eren Altuntas on AMA-5 (**[interaction ff7926af](https://github.com/meister5/qbwc-kit)** card accepted 2026-09-25T05:24:47Z). This file is byte-identical to the approved text apart from this line.*
+*Published 2026-09-25. Copy approved by Eren Altuntas on AMA-5 (card ff7926af, accepted 2026-09-25T05:24:47Z). Everything below is the approved text.*
 
 Every QuickBooks integration search lands in the same dead end. You want invoice data, you search "QuickBooks API", and you arrive at Intuit's REST API — which talks to QuickBooks **Online**: a different product, a different database, a different plan. If the books are in QuickBooks **Desktop**, none of it applies. Desktop exposes no HTTP API. There is no port to call and no token to request.
 
