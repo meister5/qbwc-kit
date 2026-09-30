@@ -18,7 +18,7 @@ SOAP 1.1, eight methods, and you host all of them. In the order the connector us
 | 2 | `clientVersion` | You vet the connector build. Return `""` to accept, `W:` to warn and continue, `E:` to refuse the update. | Returning `E:` for a version you merely dislike locks users out of their own sync. |
 | 3 | `authenticate` | Returns `[ticket, company-file-or-status]`. | Slot 1 is overloaded: a path (or `""`) means *start work on this file*, `"none"` means *authenticated but idle*, `"nvu"` means *credentials rejected*. Return the wrong one and the connector opens a company file for no reason, or asks the user to log in again forever. |
 | 4 | `sendRequestXML` | You return the next qbXML request. Empty string means nothing more to send. | An exception here faults the whole call. One broken task then cancels every task queued behind it. |
-| 5 | `receiveResponseXML` | You consume the response and return percent complete. | `100` **ends the session**. A progress calculation that rounds up early silently truncates the sync, and nothing in your logs says so. |
+| 5 | `receiveResponseXML` | You consume the response and return percent complete. | `100` **ends the session**. A progress calculation that rounds up early silently truncates the sync, and nothing in your logs says so. `-1` aborts the whole session, so reserve it for QuickBooks failing (`hresult`); a task that raises is a per-task retirement, not an abort. |
 | 6 | `connectionError` | The connector could not reach QuickBooks. | Return `"done"` to give up, or a company file path to retry against it. Retrying forever is what happens when you return something optimistic. |
 | 7 | `getLastError` | The connector asks what went wrong. | Returning an empty string loses the only diagnostic the user will ever see. |
 | 8 | `closeConnection` | Session over; clean up. | Leaked sessions if you never prune the ticket store. |
@@ -44,7 +44,7 @@ def run(self, ctx):
 
 Without that, the same job has to be flattened into a per-request state machine that tracks where it was — which is how integrations acquire a `state` column and a class of bugs nobody can reproduce.
 
-Two consequences worth stating plainly. First, **an unknown ticket is normal, not an error**: restart your server mid-update and the next callback arrives holding a ticket that no longer exists. Faulting there makes the connector retry until a human intervenes, so the honest answer is to tell it the session is over. Second, **progress caps at 99** until the work is genuinely complete, because returning 100 is not a status update — it is how you end the session.
+Two consequences worth stating plainly. First, **an unknown ticket is normal, not an error**: restart your server mid-update and the next callback arrives holding a ticket that no longer exists. Faulting there makes the connector retry until a human intervenes, so the honest answer is to tell it the session is over. Second, **progress caps at 99** until the work is genuinely complete, because returning 100 is not a status update — it is how you end the session; a task that raises is retired rather than aborting the session, and a session that ended through a retirement also caps at 99, never 100.
 
 ## qbXML is a sequence, not a bag
 

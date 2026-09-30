@@ -124,6 +124,9 @@ class Session:
     tasks: list[Task]
     created_at: float
     index: int = 0
+    #: Tasks retired because they raised. Used by :meth:`progress` to keep a
+    #: session that ended through a failure from reporting a clean 100.
+    retired: int = 0
     messages: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     closed: bool = False
@@ -149,11 +152,17 @@ class Session:
         """Percent complete, as QBWC's progress bar wants it.
 
         Reported per completed task. 100 is how the server says "session over",
-        so a session with work left must never round up to it.
+        so a session with work left must never round up to it, and neither may
+        a session that only ran out of work because a task was retired: that
+        would report a failed sync as a clean one. A retired session caps at
+        99; the ``""`` from ``sendRequestXML`` is what actually ends it.
         """
-        if self.finished or not self.tasks:
+        if not self.tasks:
             return 100
-        return min(int(self.index * 100 / len(self.tasks)), 99)
+        percent = min(int(self.index * 100 / len(self.tasks)), 99)
+        if self.finished and not self.retired:
+            return 100
+        return percent
 
     def next_request(self) -> str:
         """Return the next qbXML request, or ``""`` when the work is done."""
@@ -208,7 +217,7 @@ class Session:
             self._finish_task()
             return parsed
         except Exception:
-            self._finish_task()  # send() already exhausted the generator
+            self._retire_task()  # send() already exhausted the generator
             raise
 
         try:
@@ -221,7 +230,7 @@ class Session:
         return parsed
 
     def _abandon(self, generator: TaskRun) -> None:
-        self._finish_task()
+        self._retire_task()
         generator.close()
 
     def abort(self, message: str) -> None:
@@ -229,13 +238,22 @@ class Session:
         self.record_error(message)
         if self._generator is not None:
             self._generator.close()
-        self._finish_task()
+        self._retire_task()
 
     def _finish_task(self) -> None:
         self._generator = None
         self._pending = None
         self._awaiting = False
         self.index += 1
+
+    def _retire_task(self) -> None:
+        """Record that the current task failed, and advance past it.
+
+        A retired task is counted, so the session can carry on with the next one
+        instead of handing the connector an abort for one broken job.
+        """
+        self.retired += 1
+        self._finish_task()
 
     def record_error(self, message: str) -> None:
         self.errors.append(message)

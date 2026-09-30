@@ -242,7 +242,49 @@ class TestFailingTasks:
             session.submit_response(EMPTY)
 
         assert session.index == 1
+        assert session.retired == 1
         assert "CustomerQueryRq" in session.next_request()
+
+    def test_progress_after_a_retired_task_is_not_100(self):
+        class Broken:
+            name = "broken"
+
+            def run(self, ctx):
+                yield QBXMLRequest([qbxml.query("Customer")])
+                raise RuntimeError("disk full")
+
+        session = make_session([Broken(), RecordingTask("good")])
+        session.next_request()
+        with pytest.raises(RuntimeError, match="disk full"):
+            session.submit_response(EMPTY)
+
+        assert session.progress() <= 99
+
+        session.next_request()
+        session.submit_response(EMPTY)
+        assert session.finished
+        assert session.progress() == 99
+
+    def test_progress_is_100_when_a_session_runs_out_normally(self):
+        session = make_session([RecordingTask("good")])
+        session.next_request()
+        session.submit_response(EMPTY)
+
+        assert session.finished
+        assert session.progress() == 100
+
+    def test_abort_counts_as_a_retirement(self):
+        session = make_session([RecordingTask("first"), RecordingTask("second")])
+        session.next_request()
+        session.abort("x")
+
+        assert session.retired == 1
+        assert "second" in session.next_request()
+        session.submit_response(EMPTY)
+
+        assert session.finished
+        assert session.progress() < 100
+        assert session.last_error() == "x"
 
     def test_an_unparseable_response_does_not_restart_the_task(self):
         task = RecordingTask("a", count=3)

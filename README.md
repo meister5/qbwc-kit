@@ -114,7 +114,13 @@ is an opaque parse error from QuickBooks, so I raise at build time instead.
 
 **Returning 100 ends the session.** `receiveResponseXML` returns percent complete, and a
 progress calculation that rounds up too early silently truncates the sync. `Session.progress()`
-caps at 99 until the work is genuinely done.
+caps at 99 until the work is genuinely done. `100` is reserved for a session that ran out of
+tasks with nothing retired; a task that raises is retired and the session continues with the
+next task, with the error available from `getLastError`; a session that ended through a
+retirement reports `99`, never `100`.
+
+**A failing task retires itself and the session continues.** One broken job must not cancel
+the queue behind it; `-1` from `receiveResponseXML` is reserved for QuickBooks itself failing.
 
 **An unknown ticket is normal.** Restart the server mid-update and the next callback arrives
 with a ticket that no longer exists. Faulting makes the Web Connector retry forever, so I tell it

@@ -47,6 +47,31 @@ def build(tasks, **kwargs):
     )
 
 
+def _run_update_capturing_last_error(connector, quickbooks):
+    """Run an update, fetching ``getLastError`` just before the session closes.
+
+    ``FakeWebConnector`` only calls ``getLastError`` itself when a session
+    aborts (a negative ``receiveResponseXML``). A retired task does not abort
+    the session, so the only way to see its error message on the same
+    transcript is to ask for it through the service's own callback, right
+    before ``closeConnection`` tears the ticket down.
+    """
+    captured: list[str] = []
+    original = connector._call
+
+    def intercept(method, params):
+        if method == "closeConnection":
+            ticket = dict(params)["ticket"]
+            captured.append(original("getLastError", [("ticket", ticket)]))
+        return original(method, params)
+
+    connector._call = intercept
+    try:
+        return connector.run_update(quickbooks), (captured[0] if captured else "")
+    finally:
+        connector._call = original
+
+
 def test_full_update_cycle_collects_every_page():
     task = SyncCustomers(page_size=2)
     _, connector = build([task])
@@ -109,10 +134,13 @@ def test_unsupported_entity_surfaces_as_a_task_failure_not_silent_success():
     _, connector = build([task])
     quickbooks = FakeQuickBooks(entities={"Customer": CUSTOMERS}, supported=set())
 
-    result = connector.run_update(quickbooks)
+    result, last_error = _run_update_capturing_last_error(connector, quickbooks)
 
-    assert result.failed
-    assert "3100" in result.last_error
+    # A task that raises while handling a response is retired, not aborted, so
+    # this no longer reaches -1 -- but the error must still surface, not be
+    # silently swallowed as "0 rows".
+    assert not result.failed
+    assert "3100" in last_error
     assert task.collected == []
 
 
@@ -135,6 +163,9 @@ def test_quickbooks_side_error_aborts_the_session():
 
     assert result.failed
     assert "0x80040400" in result.last_error
+    # The abort guard (hresult set) is the only path that still aborts the
+    # whole session, so it must still hand the connector a raw -1.
+    assert -1 in result.progress
 
 
 def test_session_is_removed_on_close():
@@ -247,6 +278,37 @@ def test_a_failing_task_is_reported_through_get_last_error():
 
     assert service._do_sendRequestXML(call) == ""
     assert "reporting database is down" in session.last_error()
+
+
+class BoomOnSecondStep:
+    """Yields once successfully, then blows up while handling the response."""
+
+    name = "boom"
+
+    def run(self, ctx):
+        yield QBXMLRequest([qbxml.query("Customer", max_returned=1, iterator="Start")])
+        raise RuntimeError("handler blew up")
+
+
+def test_a_task_that_raises_while_handling_a_response_does_not_abort_the_session():
+    good = SyncCustomers(page_size=5)
+    _, connector = build([BoomOnSecondStep(), good])
+    quickbooks = FakeQuickBooks(entities={"Customer": CUSTOMERS})
+    result, last_error = _run_update_capturing_last_error(connector, quickbooks)
+
+    assert not result.failed
+    assert len(good.collected) == len(CUSTOMERS)
+    assert "blew up" in last_error
+    assert -1 not in result.progress
+
+
+def test_a_retired_task_does_not_report_100():
+    good = SyncCustomers(page_size=5)
+    _, connector = build([BoomOnSecondStep(), good])
+    result = connector.run_update(FakeQuickBooks(entities={"Customer": CUSTOMERS}))
+
+    assert 100 not in result.progress
+    assert result.close_message.startswith("Completed with")
 
 
 def test_a_malformed_qbxml_version_does_not_fault_the_call():

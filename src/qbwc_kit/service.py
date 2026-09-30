@@ -206,9 +206,11 @@ class QBWCService:
         try:
             session.submit_response(response)
         except Exception as exc:  # noqa: BLE001
+            # The task retired itself and the index moved past it, so this is a
+            # per-task failure, not a session-wide one. -1 here would tell the
+            # connector to abort and take every task behind it down too.
             session.record_error(f"{type(exc).__name__}: {exc}")
             logger.exception("task %s failed while handling a response", session.index)
-            return -1
 
         return session.progress()
 
